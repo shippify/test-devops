@@ -1,69 +1,58 @@
-# Use case: Lambda cannot list S3 and cannot reach external API
+# Use case (Candidate): Lambda cannot list S3 and cannot reach external API
 
-This folder contains a **broken** scenario for assessment or practice:
+## What you are given
+You get a public GitHub repo that runs an assessment via GitHub Actions:
 
-- **GitHub Actions** workflow deploys Terraform and invokes the Lambda to validate the fix.
-- **Terraform** provisions a VPC, private subnet (no NAT), an S3 bucket, ECR repo, and a **container image** Lambda. The Lambda uses a **Dockerfile** that has an intentional error the candidate must fix.
-- The Lambda (once the Dockerfile is fixed) tries to list S3 and call an external API; with the current infra both fail (no S3 permissions, no NAT).
+- GitHub Actions deploys AWS infrastructure with Terraform.
+- It builds a **container image** for a Lambda function and deploys it.
+- It invokes the Lambda and checks the returned result.
 
-## Problem (current state)
+The repository is intentionally **broken**. Your job is to fix the issues so the workflow passes and the Lambda returns no errors.
 
-### 1. Dockerfile (candidate must fix)
+## What is failing (current symptoms)
+When the workflow runs, the Lambda invocation reports one or more of these problems:
 
-The Lambda is built from `lambda/Dockerfile`. The Dockerfile **copies the handler to the wrong path**: `COPY main.py /tmp/`. The AWS Lambda runtime looks for the handler module in `LAMBDA_TASK_ROOT` (`/var/task`), so it cannot load `main.handler` and the function fails on invoke (e.g. "Unable to import module 'main'" or handler not found).
+- **S3-related errors** (e.g. AccessDenied when listing buckets or listing bucket objects).
+- **External API errors** (e.g. timeouts / connection failures reaching an HTTPS endpoint).
+- Potentially, **container/runtime errors** (e.g. handler/module import issues).
 
-**Fix:** Copy the module into the Lambda task root, e.g. `COPY main.py ${LAMBDA_TASK_ROOT}/` or `COPY main.py /var/task/`.
+You will see the details in the GitHub Actions logs for the `Invoke Lambda` step and the Lambda output the workflow prints.
 
-### 2. Lambda cannot list S3 buckets
+## Your task
+Make the changes required so that, after your commit, the GitHub Actions workflow:
 
-The Lambda IAM role has only `AWSLambdaBasicExecutionRole` and `AWSLambdaVPCAccessExecutionRole`; it has no `s3:ListBuckets` or `s3:ListBucket` policy → Access Denied when listing buckets/objects.
+1. Successfully deploys the infrastructure.
+2. Successfully invokes the Lambda.
+3. Reports **no Lambda errors** (the workflow fails if an `errors` array is non-empty, or if the Lambda output shape is unexpected).
 
-### 3. Lambda cannot reach external API
+## Where to look in the repo
+- `lambda/`:
+  - `Dockerfile` (container build for Lambda)
+  - `main.py` (the Lambda handler code)
+- `terraform/`:
+  - IAM for the Lambda execution role
+  - VPC/subnets/routing affecting Lambda egress
 
-The Lambda runs in a **private** subnet with **no** NAT Gateway. Outbound traffic to `https://httpbin.org` never reaches the internet → timeout.
+## Hints (without giving away the full solution)
+1. **If the workflow fails before printing “Lambda output” or shows a handler/import problem**
+   - The container image likely does not place the handler where the Lambda runtime expects it.
+2. **If you see S3 `AccessDenied`**
+   - Check the Lambda execution role permissions needed by the code in `lambda/main.py`.
+3. **If you see timeouts calling an external HTTPS URL**
+   - The Lambda runs inside VPC subnets; confirm it has a valid path to the public internet for outbound HTTPS.
 
-## How to run
+## Definition of Done
+Your submission is successful when a new run of the workflow ends with:
+- `Invoke Lambda and fail on errors` completing without failing (no “Lambda errors present” message),
+- and the printed Lambda output shows S3 listing and external API call succeeding.
 
-### Prerequisites
+## How to run (from GitHub only)
+1. Make commits/PRs in your fork.
+2. Push to `main` in your fork to trigger the workflow.
 
-- AWS account and credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
-- Add them as **repo secrets** in GitHub (so the workflow can run `terraform apply` and invoke the Lambda).
-- No local setup is required: the GitHub runner builds the Lambda Docker image and pushes it to ECR.
+## Required configuration
+In your fork, set the repo secret:
+- `AWS_ROLE_ARN` (used by GitHub OIDC to assume an AWS IAM role)
 
-### Run from GitHub (no local testing)
+Do not hardcode AWS credentials in the repo.
 
-1. Make any change in the repo (e.g. fix `lambda/Dockerfile`, Terraform IAM for S3, and/or NAT routing).
-2. Push to `main` (or open a PR to `main`).
-3. The workflow `Deploy + Invoke Lambda (assessment)` will run:
-   - `terraform apply` (create ECR first)
-   - build + push Lambda Docker image to ECR
-   - `terraform apply` (create VPC + S3 + Lambda)
-   - invoke the Lambda and check the response
-
-If the Lambda still reports errors (`errors` array not empty), the workflow fails. The logs show exactly what failed (Dockerfile handler import, S3 Access Denied, and/or external API timeout).
-
-Note: if you test from a fork, GitHub may not provide secrets to PRs from forks.
-
-Note: each workflow run uses a unique environment name (based on `github.run_id`), so it creates fresh resources. Be mindful of AWS quotas/cost.
-
-## Fix (for interviewer or candidate)
-
-1. **Dockerfile:** The handler module is not where the Lambda runtime expects it. Update the Dockerfile so the function can import and run the handler.
-2. **S3 access:** Add IAM permissions to allow the Lambda to list S3 buckets and list objects in the created bucket.
-3. **External API:** Ensure the Lambda (in private subnets) has outbound internet access (typically via NAT Gateway + a default route).
-
-## Structure
-
-```
-use-case/
-├── .github/workflows/
-│   └── terraform.yml    # deploy + invoke on push/PR
-├── lambda/
-│   ├── Dockerfile       # Broken: COPY to /tmp/ — candidate fixes to ${LAMBDA_TASK_ROOT}/
-│   └── main.py          # Lambda: list S3 + call httpbin
-├── terraform/
-│   ├── main.tf          # VPC, subnets (no NAT), S3, ECR, Lambda (Image from ECR)
-│   ├── variables.tf
-│   └── outputs.tf
-└── README.md
-```
