@@ -9,9 +9,9 @@ output "s3_bucket_id" {
 }
 
 output "vpc_id" {
-  value = data.aws_vpc.default.id
+  value = aws_vpc.main.id
 }
 
 output "private_subnet_id" {
-  value = local.lambda_subnet_id
+  value = aws_subnet.private.id
 }
