@@ -12,16 +12,72 @@ permissions:
 env:
   AWS_REGION: us-east-1
   TF_WORKING_DIR: terraform
-  TF_ENV: run-${{ github.run_id }}
+  # Stable infra naming to avoid VpcLimitExceeded / AlreadyExists collisions.
+  TF_ENV: assessment
   TF_IMAGE_TAG: ${{ github.sha }}
+  S3_BUCKET_PREFIX: devops-test-usecase-lambda-s3-api
+  ECR_REPO_NAME: devops-test-usecase-lambda-s3-api-ecr
+  LAMBDA_NAME_PREFIX: devops-test-usecase-lambda-s3-api
+  TF_STATE_KEY: use-case/lambda-s3-api/terraform.tfstate
 
 jobs:
-  deploy-and-test:
-    name: Terraform deploy + Lambda invoke
+  build-image:
+    name: Build + push Lambda image
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActionsAssessment
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          set -euo pipefail
+          AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Ensure backend S3 bucket exists
+        run: |
+          set -euo pipefail
+          AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          S3_BUCKET_NAME="${S3_BUCKET_PREFIX}-${AWS_ACCOUNT_ID}"
+          if ! aws s3api head-bucket --bucket "${S3_BUCKET_NAME}" >/dev/null 2>&1; then
+            if [ "${AWS_REGION}" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "${S3_BUCKET_NAME}"
+            else
+              aws s3api create-bucket --bucket "${S3_BUCKET_NAME}" --region "${AWS_REGION}" --create-bucket-configuration LocationConstraint="${AWS_REGION}"
+            fi
+          fi
+
+      - name: Verify ECR repository exists (do not create)
+        run: |
+          set -euo pipefail
+          aws ecr describe-repositories --repository-names "${ECR_REPO_NAME}" >/dev/null
+
+      - name: Build and push Lambda image
+        run: |
+          set -euo pipefail
+          AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          ECR_IMAGE_URI="${ECR_REGISTRY}/${ECR_REPO_NAME}:${TF_IMAGE_TAG}"
+
+          docker build -t "${ECR_REPO_NAME}:${TF_IMAGE_TAG}" use-case/lambda
+          docker tag "${ECR_REPO_NAME}:${TF_IMAGE_TAG}" "${ECR_IMAGE_URI}"
+          docker push "${ECR_IMAGE_URI}"
+
+  terraform-and-test:
+    name: Terraform deploy + invoke Lambda
+    runs-on: ubuntu-latest
+    needs: build-image
     defaults:
       run:
-        working-directory: ${{ env.TF_WORKING_DIR }}
+        working-directory: use-case/terraform
 
     steps:
       - name: Checkout
@@ -33,48 +89,39 @@ jobs:
           terraform_version: "1.6"
           terraform_wrapper: false
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: GitHubActionsAssessment
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Terraform Init
-        run: terraform init -input=false
-
-      - name: Create ECR repository (target)
-        run: |
-          terraform apply -auto-approve \
-            -input=false \
-            -target=aws_ecr_repository.lambda
+      - name: Terraform Init (remote state)
         env:
           TF_VAR_env: ${{ env.TF_ENV }}
           TF_VAR_image_tag: ${{ env.TF_IMAGE_TAG }}
-
-      - name: Build and push Lambda image to ECR
-        env:
-          TF_ENV: ${{ env.TF_ENV }}
-          TF_IMAGE_TAG: ${{ env.TF_IMAGE_TAG }}
         run: |
           set -euo pipefail
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-          ECR_REPO_NAME="${TF_ENV}-lambda-s3-api"
-          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-          ECR_IMAGE_URI="${ECR_REGISTRY}/${ECR_REPO_NAME}:${TF_IMAGE_TAG}"
+          S3_BUCKET_NAME="${S3_BUCKET_PREFIX}-${AWS_ACCOUNT_ID}"
 
-          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-          docker build -t "${ECR_REPO_NAME}:${TF_IMAGE_TAG}" ../lambda
-          docker tag "${ECR_REPO_NAME}:${TF_IMAGE_TAG}" "${ECR_IMAGE_URI}"
-          docker push "${ECR_IMAGE_URI}"
+          terraform init -input=false \
+            -backend-config="bucket=${S3_BUCKET_NAME}" \
+            -backend-config="key=${TF_STATE_KEY}" \
+            -backend-config="region=${AWS_REGION}"
 
-      - name: Terraform Apply (full)
-        run: terraform apply -auto-approve -input=false
+      - name: Terraform Apply
         env:
           TF_VAR_env: ${{ env.TF_ENV }}
           TF_VAR_image_tag: ${{ env.TF_IMAGE_TAG }}
+          TF_VAR_bucket_prefix: ${{ env.S3_BUCKET_PREFIX }}
+          TF_VAR_ecr_repo_name: ${{ env.ECR_REPO_NAME }}
+          TF_VAR_lambda_function_name_prefix: ${{ env.LAMBDA_NAME_PREFIX }}
+        run: terraform apply -auto-approve -input=false
 
       - name: Invoke Lambda and fail on errors
+        env:
+          TF_VAR_env: ${{ env.TF_ENV }}
         run: |
           set -euo pipefail
           FUNCTION_NAME="$(terraform output -raw lambda_function_name)"
@@ -94,8 +141,6 @@ jobs:
           with open(path,"r") as f:
             raw=json.load(f)
 
-          # Image Lambda success payload is expected to be the JSON returned by our handler:
-          # {"statusCode":200,"body":"{...json...}"}
           if "body" not in raw:
             raise SystemExit(f"Unexpected lambda payload shape: keys={list(raw.keys())}")
 

@@ -6,6 +6,7 @@ terraform {
       version = "~> 5.0"
     }
   }
+  backend "s3" {}
 }
 
 provider "aws" {
@@ -14,13 +15,28 @@ provider "aws" {
 
 locals {
   name = "${var.env}-${var.project}"
+  s3_bucket_name = "${var.bucket_prefix}-${data.aws_caller_identity.current.account_id}"
+  ecr_repo_name  = var.ecr_repo_name
+  lambda_name   = var.lambda_function_name_prefix
+  lambda_role_name = "${var.lambda_function_name_prefix}-lambda-role"
 }
 
+data "aws_caller_identity" "current" {}
+
 # ---------------------------------------------------------------------------
-# VPC: public and private subnets. No NAT Gateway (Lambda cannot reach internet).
+# Networking: dedicated VPC created once by Terraform state
+#
+# Broken behavior we want:
+# - Lambda in a subnet with NO default route -> external HTTPS times out
+# - S3 connectivity via Gateway VPC Endpoint -> S3 calls fail with IAM (AccessDenied)
 # ---------------------------------------------------------------------------
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
 resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
+  cidr_block           = "10.200.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
   tags = { Name = local.name }
@@ -31,13 +47,9 @@ resource "aws_internet_gateway" "main" {
   tags   = { Name = local.name }
 }
 
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.main.id
-  cidr_block              = "10.0.1.0/24"
+  cidr_block              = "10.200.1.0/24"
   availability_zone       = data.aws_availability_zones.available.names[0]
   map_public_ip_on_launch = true
   tags                    = { Name = "${local.name}-public" }
@@ -45,7 +57,7 @@ resource "aws_subnet" "public" {
 
 resource "aws_subnet" "private" {
   vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.2.0/24"
+  cidr_block        = "10.200.2.0/24"
   availability_zone = data.aws_availability_zones.available.names[0]
   tags              = { Name = "${local.name}-private" }
 }
@@ -64,7 +76,7 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# Private route table: NO default route (no NAT) → Lambda cannot reach external API
+# Private route table: NO default route (no NAT) -> Lambda cannot reach internet.
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.main.id
   tags   = { Name = "${local.name}-private" }
@@ -75,26 +87,27 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
+# Allow S3 connectivity without requiring NAT (Gateway endpoint).
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.main.id
+  service_name      = "com.amazonaws.${var.aws_region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id]
+  tags               = { Name = "${local.name}-s3-endpoint" }
+}
+
 # ---------------------------------------------------------------------------
 # S3 bucket (Lambda will try to list objects; role has no S3 permissions)
 # ---------------------------------------------------------------------------
-resource "aws_s3_bucket" "data" {
-  bucket = "${local.name}-${data.aws_caller_identity.current.account_id}"
-  tags   = { Name = local.name }
-}
-
-resource "aws_s3_bucket_versioning" "data" {
-  bucket = aws_s3_bucket.data.id
-  versioning_configuration {
-    status = "Disabled"
-  }
+data "aws_s3_bucket" "data" {
+  bucket = local.s3_bucket_name
 }
 
 # ---------------------------------------------------------------------------
 # Lambda: role with CloudWatch Logs only — no S3 permissions (cannot list buckets)
 # ---------------------------------------------------------------------------
 resource "aws_iam_role" "lambda" {
-  name = "${local.name}-lambda"
+  name = local.lambda_role_name
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -129,21 +142,16 @@ resource "aws_security_group" "lambda" {
   tags = { Name = "${local.name}-lambda" }
 }
 
-# Lambda is deployed as a container image from ECR (build from lambda/Dockerfile and push before apply).
-resource "aws_ecr_repository" "lambda" {
-  name                 = local.name
-  image_tag_mutability = "MUTABLE"
-  image_scanning_configuration {
-    scan_on_push = true
-  }
-  tags = { Name = local.name }
+# Lambda is deployed as a container image from ECR (repository is pre-created by the workflow).
+data "aws_ecr_repository" "lambda" {
+  name = local.ecr_repo_name
 }
 
 resource "aws_lambda_function" "main" {
-  function_name = local.name
+  function_name = local.lambda_name
   role          = aws_iam_role.lambda.arn
   package_type  = "Image"
-  image_uri     = "${aws_ecr_repository.lambda.repository_url}:${var.image_tag}"
+  image_uri     = "${data.aws_ecr_repository.lambda.repository_url}:${var.image_tag}"
   timeout       = 30
 
   vpc_config {
@@ -153,12 +161,10 @@ resource "aws_lambda_function" "main" {
 
   environment {
     variables = {
-      BUCKET_NAME      = aws_s3_bucket.data.id
+      BUCKET_NAME      = local.s3_bucket_name
       EXTERNAL_API_URL = "https://httpbin.org/get"
     }
   }
 
   tags = { Name = local.name }
 }
-
-data "aws_caller_identity" "current" {}

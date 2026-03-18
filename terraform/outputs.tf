@@ -5,13 +5,13 @@ output "lambda_function_name" {
 
 output "s3_bucket_id" {
   description = "S3 bucket the Lambda tries to list"
-  value       = aws_s3_bucket.data.id
+  value       = local.s3_bucket_name
 }
 
 output "vpc_id" {
-  value = aws_vpc.main.id
+  value = data.aws_vpc.default.id
 }
 
 output "private_subnet_id" {
-  value = aws_subnet.private.id
+  value = local.lambda_subnet_id
 }
