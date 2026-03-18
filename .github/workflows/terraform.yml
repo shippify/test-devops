@@ -1,0 +1,107 @@
+name: Deploy + Invoke Lambda (assessment)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+  TF_WORKING_DIR: terraform
+  TF_ENV: run-${{ github.run_id }}
+  TF_IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  deploy-and-test:
+    name: Terraform deploy + Lambda invoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6"
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActionsAssessment
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Create ECR repository (target)
+        run: |
+          terraform apply -auto-approve \
+            -input=false \
+            -target=aws_ecr_repository.lambda
+        env:
+          TF_VAR_env: ${{ env.TF_ENV }}
+          TF_VAR_image_tag: ${{ env.TF_IMAGE_TAG }}
+
+      - name: Build and push Lambda image to ECR
+        env:
+          TF_ENV: ${{ env.TF_ENV }}
+          TF_IMAGE_TAG: ${{ env.TF_IMAGE_TAG }}
+        run: |
+          set -euo pipefail
+          AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          ECR_REPO_NAME="${TF_ENV}-lambda-s3-api"
+          ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          ECR_IMAGE_URI="${ECR_REGISTRY}/${ECR_REPO_NAME}:${TF_IMAGE_TAG}"
+
+          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+          docker build -t "${ECR_REPO_NAME}:${TF_IMAGE_TAG}" ../lambda
+          docker tag "${ECR_REPO_NAME}:${TF_IMAGE_TAG}" "${ECR_IMAGE_URI}"
+          docker push "${ECR_IMAGE_URI}"
+
+      - name: Terraform Apply (full)
+        run: terraform apply -auto-approve -input=false
+        env:
+          TF_VAR_env: ${{ env.TF_ENV }}
+          TF_VAR_image_tag: ${{ env.TF_IMAGE_TAG }}
+
+      - name: Invoke Lambda and fail on errors
+        run: |
+          set -euo pipefail
+          FUNCTION_NAME="$(terraform output -raw lambda_function_name)"
+          aws lambda invoke \
+            --function-name "${FUNCTION_NAME}" \
+            --payload '{}' \
+            --cli-binary-format raw-in-base64-out \
+            /tmp/lambda_out.json
+
+          echo "---- Lambda output ----"
+          cat /tmp/lambda_out.json
+          echo "------------------------"
+
+          python3 - <<'PY'
+          import json
+          path="/tmp/lambda_out.json"
+          with open(path,"r") as f:
+            raw=json.load(f)
+
+          # Image Lambda success payload is expected to be the JSON returned by our handler:
+          # {"statusCode":200,"body":"{...json...}"}
+          if "body" not in raw:
+            raise SystemExit(f"Unexpected lambda payload shape: keys={list(raw.keys())}")
+
+          body=json.loads(raw["body"])
+          errors=body.get("errors", [])
+          if errors:
+            raise SystemExit("Lambda errors present (expected to fix): " + "; ".join(errors))
+          print("Lambda OK: no errors reported.")
+          PY
